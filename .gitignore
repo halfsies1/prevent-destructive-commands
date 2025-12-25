@@ -1,0 +1,16 @@
+# Local Claude settings (contains user-specific permissions and paths)
+.claude/settings.local.json
+
+# Keep the example file
+!.claude/settings.local.json.example
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+

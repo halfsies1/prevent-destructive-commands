@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# Claude Code Hook: Block Destructive Commands
+# This script runs as a PreToolUse hook to prevent dangerous operations
+
+# Read JSON input from stdin
+input=$(cat)
+command=$(echo "$input" | jq -r '.tool_input.command // empty')
+
+# Exit early if no command
+[ -z "$command" ] && exit 0
+
+# Define destructive patterns with descriptions
+# Format: "pattern|||description" (triple pipe delimiter to avoid conflicts with regex patterns)
+destructive_patterns=(
+    # ============ FILE DELETION ============
+    'rm[[:space:]]+(-[a-zA-Z]*)?r[a-zA-Z]*f|||rm -rf (recursive force delete)'
+    'rm[[:space:]]+(-[a-zA-Z]*)?f[a-zA-Z]*r|||rm -fr (recursive force delete)'
+    'rm[[:space:]]+-[a-zA-Z]*[[:space:]]+/|||rm with flags on root paths'
+    'rm[[:space:]]+\*|||rm with wildcards'
+    'rm[[:space:]]+-rf[[:space:]]+node_modules|||rm -rf node_modules'
+    # Windows file deletion (in case running via WSL/Git Bash)
+    'del[[:space:]]+/s|||del /s (recursive delete)'
+    'del[[:space:]]+/q|||del /q (quiet delete)'
+    'rmdir[[:space:]]+/s|||rmdir /s (recursive directory delete)'
+    'Remove-Item.*-Recurse.*-Force|||Remove-Item -Recurse -Force'
+    'Remove-Item.*-Force.*-Recurse|||Remove-Item -Force -Recurse'
+
+    # ============ GIT DESTRUCTIVE OPERATIONS ============
+    # Git reset (all variants)
+    'git[[:space:]]+reset[[:space:]]+--hard|||git reset --hard'
+    'git[[:space:]]+reset[[:space:]]+--mixed|||git reset --mixed'
+    'git[[:space:]]+reset[[:space:]]+HEAD~|||git reset HEAD~ (undo commits)'
+    'git[[:space:]]+reset[[:space:]]+HEAD\^|||git reset HEAD^ (undo commits)'
+    'git[[:space:]]+reset[[:space:]]+[a-f0-9]{7,40}|||git reset to specific commit'
+    # Git clean
+    'git[[:space:]]+clean[[:space:]]+-[a-zA-Z]*f|||git clean -f (force clean untracked)'
+    'git[[:space:]]+clean[[:space:]]+-[a-zA-Z]*d|||git clean -d (clean directories)'
+    # Git force push
+    'git[[:space:]]+push[[:space:]]+.*--force|||git push --force'
+    'git[[:space:]]+push[[:space:]]+-f|||git push -f (force)'
+    'git[[:space:]]+push[[:space:]]+.*\+|||git push with + (force)'
+    'git[[:space:]]+push[[:space:]]+origin[[:space:]]+:|||git push origin :branch (delete remote branch)'  
+    # Git checkout destructive
+    'git[[:space:]]+checkout[[:space:]]+--[[:space:]]+\.|||git checkout -- . (discard all changes)'        
+    'git[[:space:]]+checkout[[:space:]]+\.|||git checkout . (discard all changes)'
+    # Git restore destructive
+    'git[[:space:]]+restore[[:space:]]+\.|||git restore . (discard all changes)'
+    'git[[:space:]]+restore[[:space:]]+--staged[[:space:]]+\.|||git restore --staged . (unstage all)'      
+    # Git branch delete
+    'git[[:space:]]+branch[[:space:]]+-D|||git branch -D (force delete branch)'
+    # Git stash destructive
+    'git[[:space:]]+stash[[:space:]]+drop|||git stash drop'
+    'git[[:space:]]+stash[[:space:]]+clear|||git stash clear'
+    # Git reflog expire
+    'git[[:space:]]+reflog[[:space:]]+expire|||git reflog expire'
+    'git[[:space:]]+gc[[:space:]]+--prune|||git gc --prune'
+
+    # ============ GITHUB CLI DESTRUCTIVE ============
+    'gh[[:space:]]+repo[[:space:]]+delete|||gh repo delete'
+    'gh[[:space:]]+release[[:space:]]+delete|||gh release delete'
+    'gh[[:space:]]+pr[[:space:]]+close.*--delete-branch|||gh pr close --delete-branch'
+    'gh[[:space:]]+auth[[:space:]]+logout|||gh auth logout'
+    'gh[[:space:]]+repo[[:space:]]+archive|||gh repo archive'
+    'gh[[:space:]]+api[[:space:]]+-X[[:space:]]+DELETE|||gh api -X DELETE'
+    'gh[[:space:]]+api[[:space:]]+--method[[:space:]]+DELETE|||gh api --method DELETE'
+
+    # ============ DATABASE DESTRUCTIVE ============
+    'DROP[[:space:]]+DATABASE|||DROP DATABASE'
+    'DROP[[:space:]]+TABLE|||DROP TABLE'
+    'DROP[[:space:]]+SCHEMA|||DROP SCHEMA'
+    'TRUNCATE[[:space:]]+TABLE|||TRUNCATE TABLE'
+    'DELETE[[:space:]]+FROM[[:space:]]+[[:alnum:]_]+[[:space:]]*;|||DELETE FROM table; (no WHERE clause)'
+    'prisma[[:space:]]+migrate[[:space:]]+reset|||prisma migrate reset'
+    'prisma[[:space:]]+db[[:space:]]+push[[:space:]]+--force-reset|||prisma db push --force-reset'
+
+    # ============ DOCKER DESTRUCTIVE ============
+    'docker[[:space:]]+system[[:space:]]+prune|||docker system prune'
+    'docker[[:space:]]+volume[[:space:]]+rm|||docker volume rm'
+    'docker[[:space:]]+volume[[:space:]]+prune|||docker volume prune'
+    'docker[[:space:]]+container[[:space:]]+prune|||docker container prune'
+    'docker[[:space:]]+image[[:space:]]+prune[[:space:]]+-a|||docker image prune -a'
+    'docker[[:space:]]+compose[[:space:]]+down[[:space:]]+-v|||docker compose down -v (removes volumes)'   
+
+    # ============ SYSTEM DESTRUCTIVE ============
+    'mkfs\.|||mkfs (format filesystem)'
+    'dd[[:space:]]+.*of=/dev/|||dd to device'
+    ':(){:|:&};:|||Fork bomb'
+    '>[[:space:]]*/dev/sd|||Write to disk device'
+    'chmod[[:space:]]+-R[[:space:]]+777[[:space:]]+/|||chmod -R 777 / (dangerous permissions)'
+    'chown[[:space:]]+-R.*/|||chown -R on root'
+
+    # ============ NPM/NODE DESTRUCTIVE ============
+    'npm[[:space:]]+cache[[:space:]]+clean[[:space:]]+--force|||npm cache clean --force'
+    'npx[[:space:]]+kill-port|||npx kill-port'
+)
+
+for entry in "${destructive_patterns[@]}"; do
+    # Split pattern and description using ||| delimiter (avoids conflict with regex pipe)
+    pattern="${entry%%|||*}"
+    desc="${entry#*|||}"
+    
+    if echo "$command" | grep -qEi "$pattern"; then
+        echo "BLOCKED: Destructive command detected!" >&2
+        echo "Pattern: $desc" >&2
+        echo "Command: $command" >&2
+        echo "" >&2
+        echo "This command has been blocked by the Claude Code safety hook." >&2
+        echo "If you need to run this command, please do so manually outside of Claude." >&2
+        exit 2  # Exit code 2 blocks the tool and shows stderr to Claude
+    fi
+done
+
+# Command is safe, allow it
+exit 0
